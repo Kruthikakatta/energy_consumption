@@ -6,6 +6,7 @@ FIXED: Daily forecast endpoint now works
 
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, validator
 from typing import Optional, List, Dict, Literal
 import joblib
@@ -38,11 +39,16 @@ app.add_middleware(
 # GLOBAL VARIABLES & MODEL LOADING
 # =========================================================
 
-MODEL_PATH = Path(r"D:\energy_project\Model\energy_model.pkl")
+MODEL_PATH = Path(__file__).parent.parent / "Model" / "energy_model.pkl"
 FEATURES = [
     'Temperature', 'Humidity', 'SquareFootage', 'Occupancy',
-    'HVACUsage', 'LightingUsage', 'DayOfWeek', 'Holiday',
-    'Hour', 'Day', 'Month', 'WeekendLabel', 'TimePeriodLabel'
+    'HVACUsage', 'LightingUsage', 'RenewableEnergy',
+    'DayOfWeek', 'Holiday', 'Hour', 'Day', 'Month',
+    'WeekendLabel', 'TimePeriodLabel',
+    'HourSin', 'HourCos', 'MonthSin', 'MonthCos',
+    'DayOfWeekSin', 'DayOfWeekCos',
+    'Temp_x_Occupancy', 'Temp_x_HVAC', 'Temp_squared',
+    'Occ_x_Lighting', 'Occ_x_HVAC', 'Energy_intensity', 'Renewable_ratio'
 ]
 
 # Pricing constants (INR per kWh)
@@ -284,27 +290,79 @@ def map_user_friendly_to_technical(user_input: UserFriendlyInput) -> Dict:
     }
 
 
+def estimate_renewable_energy(hour: int) -> float:
+    """Estimate solar energy generation based on hour of day (peaking at noon)."""
+    if 6 <= hour <= 18:
+        return float(max(0.0, 15.0 * np.sin(np.pi * (hour - 6) / 12)))
+    return 0.0
+
+
 def prepare_model_input(technical_params: Dict) -> pd.DataFrame:
     """Prepare feature vector for model prediction."""
-    # Calculate derived features
-    weekend_label = get_weekend_label(technical_params["day_of_week"])
-    time_period_label = get_time_period(technical_params["hour"])
+    # 1. Core variables
+    temp = technical_params["temperature"]
+    humidity = technical_params["humidity"]
+    sqft = technical_params["square_footage"]
+    occ = technical_params["occupancy"]
+    hvac = technical_params["hvac_usage"]
+    lighting = technical_params["lighting_usage"]
+    dow = technical_params["day_of_week"]
+    holiday = technical_params["holiday"]
+    hour = technical_params["hour"]
+    day = technical_params["day"]
+    month = technical_params["month"]
     
-    # Create feature dictionary matching model's expected order
+    weekend_label = get_weekend_label(dow)
+    time_period_label = get_time_period(hour)
+    
+    # Estimate renewable energy based on the hour
+    renewable = estimate_renewable_energy(hour)
+    
+    # 2. Cyclical encodings
+    hour_sin = np.sin(2 * np.pi * hour / 24)
+    hour_cos = np.cos(2 * np.pi * hour / 24)
+    month_sin = np.sin(2 * np.pi * month / 12)
+    month_cos = np.cos(2 * np.pi * month / 12)
+    dow_sin = np.sin(2 * np.pi * dow / 7)
+    dow_cos = np.cos(2 * np.pi * dow / 7)
+    
+    # 3. Interaction features
+    temp_x_occ = temp * occ
+    temp_x_hvac = temp * hvac
+    temp_squared = temp ** 2
+    occ_x_light = occ * lighting
+    occ_x_hvac = occ * hvac
+    energy_intensity = occ / (sqft + 1)
+    renewable_ratio = renewable / (temp + 1)
+    
     features_dict = {
-        'Temperature': technical_params["temperature"],
-        'Humidity': technical_params["humidity"],
-        'SquareFootage': technical_params["square_footage"],
-        'Occupancy': technical_params["occupancy"],
-        'HVACUsage': technical_params["hvac_usage"],
-        'LightingUsage': technical_params["lighting_usage"],
-        'DayOfWeek': technical_params["day_of_week"],
-        'Holiday': technical_params["holiday"],
-        'Hour': technical_params["hour"],
-        'Day': technical_params["day"],
-        'Month': technical_params["month"],
+        'Temperature': temp,
+        'Humidity': humidity,
+        'SquareFootage': sqft,
+        'Occupancy': occ,
+        'HVACUsage': hvac,
+        'LightingUsage': lighting,
+        'RenewableEnergy': renewable,
+        'DayOfWeek': dow,
+        'Holiday': holiday,
+        'Hour': hour,
+        'Day': day,
+        'Month': month,
         'WeekendLabel': weekend_label,
-        'TimePeriodLabel': time_period_label
+        'TimePeriodLabel': time_period_label,
+        'HourSin': hour_sin,
+        'HourCos': hour_cos,
+        'MonthSin': month_sin,
+        'MonthCos': month_cos,
+        'DayOfWeekSin': dow_sin,
+        'DayOfWeekCos': dow_cos,
+        'Temp_x_Occupancy': temp_x_occ,
+        'Temp_x_HVAC': temp_x_hvac,
+        'Temp_squared': temp_squared,
+        'Occ_x_Lighting': occ_x_light,
+        'Occ_x_HVAC': occ_x_hvac,
+        'Energy_intensity': energy_intensity,
+        'Renewable_ratio': renewable_ratio
     }
     
     return pd.DataFrame([features_dict])
@@ -347,9 +405,8 @@ def make_prediction(technical_params: Dict) -> PredictionResponse:
         hourly_consumption = 2.5  # Realistic value for a home
     else:
         raw_prediction = float(MODEL.predict(model_input)[0])
-        # Scale down the model output to realistic values
-        hourly_consumption = raw_prediction / 25
-        hourly_consumption = max(0.5, min(hourly_consumption, 15))
+        # Use raw prediction directly (already scaled and realistic in new dataset)
+        hourly_consumption = max(1.0, raw_prediction)
     
     # Calculate daily and monthly estimates
     daily_consumption = hourly_consumption * 24
@@ -393,23 +450,410 @@ def make_prediction(technical_params: Dict) -> PredictionResponse:
 # API ENDPOINTS
 # =========================================================
 
-@app.get("/")
+@app.get("/", response_class=HTMLResponse)
 async def root():
-    """Root endpoint with API information."""
-    return {
-        "message": "Energy Consumption Forecasting API",
-        "version": "1.0.0",
-        "status": "operational",
-        "model_loaded": MODEL is not None,
-        "endpoints": {
-            "predict_simple": "/predict/simple",
-            "predict_technical": "/predict/technical",
-            "predict_daily": "/predict/daily",
-            "compare_scenarios": "/compare",
-            "model_info": "/model/info",
-            "health": "/health"
-        }
-    }
+    """Root endpoint - Beautiful API Dashboard."""
+    model_status = "✅ Loaded" if MODEL is not None else "⚠️ Mock Mode"
+    model_badge = "badge-success" if MODEL is not None else "badge-warning"
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    html = f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>⚡ Energy Forecasting API</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    :root {{
+      --bg: #050a14;
+      --surface: #0d1627;
+      --surface2: #111e35;
+      --border: #1e3a5f;
+      --accent: #00d4ff;
+      --accent2: #7c3aed;
+      --accent3: #10b981;
+      --warn: #f59e0b;
+      --text: #e2e8f0;
+      --muted: #64748b;
+      --glow: 0 0 30px rgba(0, 212, 255, 0.15);
+    }}
+    body {{
+      font-family: 'Inter', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }}
+
+    /* Animated background */
+    body::before {{
+      content: '';
+      position: fixed;
+      inset: 0;
+      background:
+        radial-gradient(ellipse 80% 50% at 20% 10%, rgba(0,212,255,0.06) 0%, transparent 60%),
+        radial-gradient(ellipse 60% 40% at 80% 80%, rgba(124,58,237,0.06) 0%, transparent 60%);
+      pointer-events: none;
+      z-index: 0;
+    }}
+
+    .container {{ position: relative; z-index: 1; max-width: 1100px; margin: 0 auto; padding: 40px 24px; }}
+
+    /* HEADER */
+    .header {{
+      text-align: center;
+      padding: 60px 0 40px;
+    }}
+    .logo {{
+      display: inline-flex;
+      align-items: center;
+      gap: 14px;
+      margin-bottom: 20px;
+    }}
+    .logo-icon {{
+      width: 64px; height: 64px;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      border-radius: 18px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 30px;
+      box-shadow: 0 0 40px rgba(0,212,255,0.3);
+      animation: pulse 3s ease-in-out infinite;
+    }}
+    @keyframes pulse {{
+      0%, 100% {{ box-shadow: 0 0 40px rgba(0,212,255,0.3); }}
+      50% {{ box-shadow: 0 0 60px rgba(0,212,255,0.5), 0 0 80px rgba(124,58,237,0.2); }}
+    }}
+    h1 {{
+      font-size: 2.6rem;
+      font-weight: 800;
+      background: linear-gradient(135deg, #fff 0%, var(--accent) 60%, var(--accent2) 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      line-height: 1.2;
+    }}
+    .tagline {{
+      color: var(--muted);
+      font-size: 1.05rem;
+      margin-top: 10px;
+      font-weight: 400;
+    }}
+
+    /* STATUS BAR */
+    .status-bar {{
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 20px;
+      flex-wrap: wrap;
+      margin: 30px 0;
+    }}
+    .badge {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 18px;
+      border-radius: 100px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      border: 1px solid transparent;
+    }}
+    .badge-success {{ background: rgba(16,185,129,0.12); border-color: rgba(16,185,129,0.3); color: #34d399; }}
+    .badge-warning {{ background: rgba(245,158,11,0.12); border-color: rgba(245,158,11,0.3); color: #fbbf24; }}
+    .badge-info    {{ background: rgba(0,212,255,0.10); border-color: rgba(0,212,255,0.25); color: var(--accent); }}
+    .badge-purple  {{ background: rgba(124,58,237,0.12); border-color: rgba(124,58,237,0.3); color: #a78bfa; }}
+    .dot {{ width: 8px; height: 8px; border-radius: 50%; background: currentColor; animation: blink 1.5s infinite; }}
+    @keyframes blink {{ 0%,100% {{ opacity:1 }} 50% {{ opacity:0.3 }} }}
+
+    /* CARDS GRID */
+    .grid {{ display: grid; gap: 20px; margin: 36px 0; }}
+    .grid-3 {{ grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }}
+    .grid-2 {{ grid-template-columns: repeat(auto-fit, minmax(440px, 1fr)); }}
+
+    .card {{
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 28px;
+      transition: transform 0.2s, border-color 0.2s, box-shadow 0.2s;
+    }}
+    .card:hover {{
+      transform: translateY(-3px);
+      border-color: rgba(0,212,255,0.35);
+      box-shadow: var(--glow);
+    }}
+    .card-header {{
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 20px;
+    }}
+    .card-icon {{
+      width: 42px; height: 42px;
+      border-radius: 12px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 20px;
+      flex-shrink: 0;
+    }}
+    .icon-blue   {{ background: rgba(0,212,255,0.12); }}
+    .icon-purple {{ background: rgba(124,58,237,0.12); }}
+    .icon-green  {{ background: rgba(16,185,129,0.12); }}
+    .icon-orange {{ background: rgba(245,158,11,0.12); }}
+    .card-title {{ font-size: 1rem; font-weight: 600; color: var(--text); }}
+    .card-sub   {{ font-size: 0.78rem; color: var(--muted); margin-top: 2px; }}
+
+    /* ENDPOINTS LIST */
+    .endpoint-list {{ display: flex; flex-direction: column; gap: 10px; }}
+    .endpoint {{
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 12px 16px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      text-decoration: none;
+      transition: border-color 0.2s, background 0.2s;
+      cursor: pointer;
+    }}
+    .endpoint:hover {{
+      border-color: rgba(0,212,255,0.4);
+      background: rgba(0,212,255,0.04);
+    }}
+    .method {{
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.7rem;
+      font-weight: 700;
+      padding: 3px 8px;
+      border-radius: 6px;
+      min-width: 44px;
+      text-align: center;
+    }}
+    .method-get  {{ background: rgba(16,185,129,0.15); color: #34d399; border: 1px solid rgba(16,185,129,0.25); }}
+    .method-post {{ background: rgba(0,212,255,0.12); color: var(--accent); border: 1px solid rgba(0,212,255,0.2); }}
+    .path {{
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.82rem;
+      color: var(--text);
+      flex: 1;
+    }}
+    .ep-desc {{ font-size: 0.75rem; color: var(--muted); text-align: right; }}
+
+    /* STATS */
+    .stat {{ text-align: center; padding: 16px; }}
+    .stat-value {{
+      font-size: 2rem;
+      font-weight: 800;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }}
+    .stat-label {{ font-size: 0.8rem; color: var(--muted); margin-top: 4px; }}
+
+    /* FEATURES */
+    .feature-list {{ display: flex; flex-direction: column; gap: 8px; }}
+    .feature {{
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 0.88rem;
+      color: var(--muted);
+    }}
+    .feature span {{ color: var(--accent3); font-size: 1rem; }}
+
+    /* FOOTER */
+    .footer {{
+      text-align: center;
+      padding: 40px 0 20px;
+      color: var(--muted);
+      font-size: 0.82rem;
+      border-top: 1px solid var(--border);
+      margin-top: 40px;
+    }}
+    .footer a {{ color: var(--accent); text-decoration: none; }}
+    .footer a:hover {{ text-decoration: underline; }}
+
+    /* Animated energy bar */
+    .energy-bar-wrap {{ margin-top: 16px; }}
+    .energy-bar-label {{ display: flex; justify-content: space-between; font-size: 0.78rem; color: var(--muted); margin-bottom: 6px; }}
+    .energy-bar {{
+      height: 6px;
+      border-radius: 10px;
+      background: var(--surface2);
+      overflow: hidden;
+    }}
+    .energy-bar-fill {{
+      height: 100%;
+      border-radius: 10px;
+      animation: fillBar 2s ease-out forwards;
+    }}
+    @keyframes fillBar {{ from {{ width: 0 }} }}
+    .fill-cyan   {{ background: linear-gradient(90deg, var(--accent), #0099bb); width: 92%; }}
+    .fill-purple {{ background: linear-gradient(90deg, var(--accent2), #9f1bfa); width: 85%; }}
+    .fill-green  {{ background: linear-gradient(90deg, var(--accent3), #059669); width: 78%; }}
+  </style>
+</head>
+<body>
+<div class="container">
+
+  <!-- HEADER -->
+  <div class="header">
+    <div class="logo">
+      <div class="logo-icon">⚡</div>
+    </div>
+    <h1>Energy Forecasting API</h1>
+    <p class="tagline">AI-powered energy consumption prediction for homes &amp; commercial buildings</p>
+    <div class="status-bar">
+      <span class="badge badge-success"><span class="dot"></span> API Online</span>
+      <span class="badge {model_badge}">{model_status}</span>
+      <span class="badge badge-info">v1.0.0</span>
+      <span class="badge badge-purple">🕒 {now}</span>
+    </div>
+  </div>
+
+  <!-- STATS ROW -->
+  <div class="grid grid-3">
+    <div class="card">
+      <div class="stat">
+        <div class="stat-value">6</div>
+        <div class="stat-label">API Endpoints</div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="stat">
+        <div class="stat-value">27</div>
+        <div class="stat-label">ML Features</div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="stat">
+        <div class="stat-value">24h</div>
+        <div class="stat-label">Forecast Window</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ENDPOINTS + MODEL INFO -->
+  <div class="grid grid-2">
+
+    <!-- ENDPOINTS -->
+    <div class="card">
+      <div class="card-header">
+        <div class="card-icon icon-blue">🔌</div>
+        <div>
+          <div class="card-title">API Endpoints</div>
+          <div class="card-sub">All available routes</div>
+        </div>
+      </div>
+      <div class="endpoint-list">
+        <a class="endpoint" href="/docs" target="_blank">
+          <span class="method method-get">GET</span>
+          <span class="path">/docs</span>
+          <span class="ep-desc">Interactive Docs</span>
+        </a>
+        <div class="endpoint">
+          <span class="method method-get">GET</span>
+          <span class="path">/health</span>
+          <span class="ep-desc">Health Check</span>
+        </div>
+        <div class="endpoint">
+          <span class="method method-post">POST</span>
+          <span class="path">/predict/simple</span>
+          <span class="ep-desc">Easy Prediction</span>
+        </div>
+        <div class="endpoint">
+          <span class="method method-post">POST</span>
+          <span class="path">/predict/technical</span>
+          <span class="ep-desc">Advanced Inputs</span>
+        </div>
+        <div class="endpoint">
+          <span class="method method-post">POST</span>
+          <span class="path">/predict/daily</span>
+          <span class="ep-desc">24-Hour Forecast</span>
+        </div>
+        <div class="endpoint">
+          <span class="method method-post">POST</span>
+          <span class="path">/compare</span>
+          <span class="ep-desc">Scenario Compare</span>
+        </div>
+        <div class="endpoint">
+          <span class="method method-get">GET</span>
+          <span class="path">/model/info</span>
+          <span class="ep-desc">Model Metadata</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- MODEL INFO -->
+    <div class="card">
+      <div class="card-header">
+        <div class="card-icon icon-purple">🤖</div>
+        <div>
+          <div class="card-title">Model Information</div>
+          <div class="card-sub">ML model details &amp; accuracy metrics</div>
+        </div>
+      </div>
+      <div class="feature-list">
+        <div class="feature"><span>▸</span> Algorithm: Random Forest Regressor</div>
+        <div class="feature"><span>▸</span> Features: 27 engineered inputs</div>
+        <div class="feature"><span>▸</span> Cyclical encodings (hour, month, day)</div>
+        <div class="feature"><span>▸</span> Interaction &amp; polynomial features</div>
+        <div class="feature"><span>▸</span> Domestic rate: ₹6.50 / kWh</div>
+        <div class="feature"><span>▸</span> Commercial rate: ₹9.00 / kWh</div>
+      </div>
+      <div class="energy-bar-wrap">
+        <div class="energy-bar-label"><span>Accuracy (R²)</span><span>~92%</span></div>
+        <div class="energy-bar"><div class="energy-bar-fill fill-cyan"></div></div>
+        <div class="energy-bar-label" style="margin-top:10px"><span>Coverage</span><span>Homes &amp; Commercial</span></div>
+        <div class="energy-bar"><div class="energy-bar-fill fill-purple"></div></div>
+        <div class="energy-bar-label" style="margin-top:10px"><span>Forecast Horizon</span><span>24 hours</span></div>
+        <div class="energy-bar"><div class="energy-bar-fill fill-green"></div></div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- QUICK START -->
+  <div class="card">
+    <div class="card-header">
+      <div class="card-icon icon-green">🚀</div>
+      <div>
+        <div class="card-title">Quick Start</div>
+        <div class="card-sub">Try a prediction right now</div>
+      </div>
+    </div>
+    <div style="background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:20px;">
+      <div style="font-family:'JetBrains Mono',monospace;font-size:0.82rem;color:#a78bfa;margin-bottom:8px;">POST /predict/simple</div>
+      <pre style="font-family:'JetBrains Mono',monospace;font-size:0.78rem;color:#94a3b8;line-height:1.8;overflow-x:auto;">{{
+  "property_type": "Home",
+  "property_size": "Medium",
+  "people_count": 4,
+  "ac_usage": "Medium",
+  "lighting_usage": "Low",
+  "weather_condition": "Hot",
+  "hour": 14,
+  "day_of_week": 2,
+  "holiday": 0,
+  "day": 26,
+  "month": 5
+}}</pre>
+    </div>
+    <p style="margin-top:16px;font-size:0.85rem;color:var(--muted);">👉 Visit <a href="/docs" style="color:var(--accent);text-decoration:none;font-weight:600;">/docs</a> for the full interactive Swagger UI, or <a href="/redoc" style="color:var(--accent2);text-decoration:none;font-weight:600;">/redoc</a> for ReDoc documentation.</p>
+  </div>
+
+  <div class="footer">
+    <p>⚡ <strong>Energy Consumption Forecasting System</strong> &nbsp;|&nbsp; FastAPI v1.0.0 &nbsp;|&nbsp; Built for precision energy prediction</p>
+    <p style="margin-top:8px;">Swagger UI: <a href="/docs">/docs</a> &nbsp;•&nbsp; ReDoc: <a href="/redoc">/redoc</a> &nbsp;•&nbsp; Health: <a href="/health">/health</a></p>
+  </div>
+
+</div>
+</body>
+</html>
+    """
+    return HTMLResponse(content=html)
 
 
 @app.get("/health")

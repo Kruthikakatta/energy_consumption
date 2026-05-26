@@ -1,6 +1,5 @@
 import React, { useState } from 'react';
 import PredictionForm from '../components/PredictionForm';
-import LoadingSpinner from '../components/LoadingSpinner';
 import ErrorAlert from '../components/ErrorAlert';
 import { predictSimple } from '../services/api';
 import './Compare.css';
